@@ -17,7 +17,6 @@ from src.database.connection import db_pool
 
 logger = setup_logger(__name__)
 
-
 @dataclass
 class ModelPrediction:
     '''container for model prediction'''
@@ -25,7 +24,6 @@ class ModelPrediction:
     confidence_interval: Tuple[float, float]
     feature_importance: Dict[str, float]
     model_name: str
-
 
 @dataclass
 class ModelPerformance:
@@ -36,7 +34,6 @@ class ModelPerformance:
     r2_score: float
     cv_score: float
 
-
 class F1PredictiveModels:
     def __init__(self):
         self.logger = setup_logger(self.__class__.__name__)
@@ -44,6 +41,7 @@ class F1PredictiveModels:
         self.scalers = {}
         self.label_encoders = {}
         self.imputers = {}
+        self.feature_names = {}  # Store feature names for each model
         self.model_dir = Config.BASE_DIR / "models" / "saved"
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -67,20 +65,18 @@ class F1PredictiveModels:
                 n_estimators=50, 
                 random_state=42,
                 max_depth=10
-            ),
-            'pit_stop_strategy': GradientBoostingRegressor(
-                n_estimators=50, 
-                random_state=42
             )
         }
 
     def prepare_lap_time_features(self, session_ids: List[str]) -> pd.DataFrame:
-        """Prepare features for lap time prediction with better error handling"""
+        """Prepare features for lap time prediction with data leakage prevention"""
         self.logger.info(f"Preparing lap time features for {len(session_ids)} sessions")
 
         try: 
             with db_pool.get_connection() as conn:
                 session_placeholders = ','.join(['?' for _ in session_ids])
+                
+                # CRITICAL: Remove features that could cause data leakage
                 query = f"""
                     SELECT 
                         l.lap_time,
@@ -88,9 +84,6 @@ class F1PredictiveModels:
                         l.lap_number,
                         l.tire_compound,
                         COALESCE(l.tire_age, 1) as tire_age,
-                        l.sector_1_time,
-                        l.sector_2_time,
-                        l.sector_3_time,
                         l.speed_i1,
                         l.speed_i2,
                         l.speed_fl,
@@ -127,22 +120,28 @@ class F1PredictiveModels:
             return pd.DataFrame()
         
     def _add_derived_features_safe(self, df: pd.DataFrame) -> pd.DataFrame:
-        '''Add derived features with robust error handling'''
+        '''Add derived features with data leakage prevention'''
         try:
             # Sort by session, driver, and lap number for proper shift operations
             df = df.sort_values(['session_id', 'driver_code', 'lap_number'])
             
-            # Previous lap performance with safe defaults
+            # FIXED: Use only PREVIOUS lap data to avoid data leakage
             df['prev_lap_time'] = df.groupby(['session_id', 'driver_code'])['lap_time'].shift(1)
-            df['prev_lap_time'] = df['prev_lap_time'].fillna(df['lap_time'])
             
-            df['lap_time_trend'] = df['lap_time'] - df['prev_lap_time']
+            # For first lap of each driver, use session average
+            session_avg = df.groupby('session_id')['lap_time'].transform('mean')
+            df['prev_lap_time'] = df['prev_lap_time'].fillna(session_avg)
+            
+            # Lap time trend based on PREVIOUS laps only
+            df['prev_prev_lap_time'] = df.groupby(['session_id', 'driver_code'])['lap_time'].shift(2)
+            df['prev_prev_lap_time'] = df['prev_prev_lap_time'].fillna(df['prev_lap_time'])
+            df['lap_time_trend'] = df['prev_lap_time'] - df['prev_prev_lap_time']
             df['lap_time_trend'] = df['lap_time_trend'].fillna(0.0)
 
             # Tire stint calculation
             df['stint_lap'] = df.groupby(['session_id', 'driver_code', 'tire_compound']).cumcount() + 1
 
-            # Position changes with safe handling
+            # Position changes with safe handling (using previous position)
             df['prev_position'] = df.groupby(['session_id', 'driver_code'])['position'].shift(1)
             df['prev_position'] = df['prev_position'].fillna(df['position'])
             df['position_change'] = df['prev_position'] - df['position']
@@ -151,27 +150,29 @@ class F1PredictiveModels:
             # Weather impact
             df['temp_difference'] = df['track_temp'] - df['air_temp']
 
-            # Compound performance relative to session (safe calculation)
-            try:
-                compound_avg = df.groupby(['session_id', 'tire_compound'])['lap_time'].transform('mean')
-                df['compound_relative_pace'] = df['lap_time'] - compound_avg
-            except:
-                df['compound_relative_pace'] = 0.0
+            # Driver form - rolling avg of PREVIOUS 5 laps
+            df['driver_form'] = df.groupby(['session_id', 'driver_code'])['lap_time'].shift(1).rolling(
+                window=5, min_periods=1
+            ).mean()
+            df['driver_form'] = df['driver_form'].fillna(session_avg)
 
-            # Driver form - rolling avg of last 5 laps with safe window
-            try:
-                df['driver_form'] = df.groupby(['session_id', 'driver_code'])['lap_time'].transform(
-                    lambda x: x.rolling(window=min(5, len(x)), min_periods=1).mean()
-                )
-            except:
-                df['driver_form'] = df['lap_time']
+            # Relative pace to session average (safer than compound average)
+            df['relative_pace'] = df['prev_lap_time'] - session_avg
+
+            # Remove the problematic compound_relative_pace that might cause leakage
+            # Instead use a safer version based on historical data
+            compound_session_avg = df.groupby(['session_id', 'tire_compound'])['prev_lap_time'].transform('mean')
+            df['compound_historical_pace'] = df['prev_lap_time'] - compound_session_avg
 
             # Fill any remaining NaN values with sensible defaults
             numeric_columns = df.select_dtypes(include=[np.number]).columns
             df[numeric_columns] = df[numeric_columns].fillna(df[numeric_columns].median())
 
+            # Remove the original lap_time from features to prevent accidental inclusion
+            feature_columns = [col for col in df.columns if col not in ['lap_time']]
+            
             return df
-        
+
         except Exception as e:
             self.logger.error(f'Error adding derived features: {e}')
             return df
@@ -241,33 +242,46 @@ class F1PredictiveModels:
             return {}
 
     def _prepare_model_data_safe(self, data: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, pd.Series]:
-        """Prepare model data with comprehensive data cleaning"""
+        """Prepare model data with strict data leakage prevention"""
         try:
-            feature_columns = [
-                'lap_number', 'tire_age', 'sector_1_time', 'sector_2_time',
-                'sector_3_time', 'speed_i1', 'speed_i2', 'speed_fl',
-                'position', 'air_temp', 'track_temp', 'humidity',
-                'prev_lap_time', 'lap_time_trend', 'stint_lap',
-                'position_change', 'temp_difference', 'compound_relative_pace',
-                'driver_form'
+            # CRITICAL: Define features that CANNOT cause data leakage
+            safe_feature_columns = [
+                'lap_number', 'tire_age', 'position', 
+                'air_temp', 'track_temp', 'humidity',
+                'prev_lap_time',  # Previous lap is safe
+                'lap_time_trend',  # Based on previous laps
+                'stint_lap', 'position_change', 'temp_difference',
+                'driver_form',  # Based on previous laps
+                'relative_pace',  # Based on previous laps
+                'compound_historical_pace'  # Based on previous laps
             ]
 
+            # Speed trap data (if available)
+            speed_features = ['speed_i1', 'speed_i2', 'speed_fl']
+            available_speed = [col for col in speed_features if col in data.columns and data[col].notna().sum() > len(data) * 0.3]
+            
             categorical_features = ['tire_compound', 'session_type', 'circuit_name', 'driver_code']
 
             # Filter available features
-            available_features = [col for col in feature_columns if col in data.columns]
+            available_features = [col for col in safe_feature_columns if col in data.columns]
             available_categorical = [col for col in categorical_features if col in data.columns]
+            
+            # Add speed features if they have enough data
+            available_features.extend(available_speed)
 
-            if not available_features and not available_categorical:
+            if not available_features:
                 self.logger.error("No valid features found in data")
                 return pd.DataFrame(), pd.Series()
 
             # Create feature matrix
             X = data[available_features + available_categorical].copy()
             
+            # Store feature names for this model
+            all_feature_names = available_features + available_categorical
+            self.feature_names[target] = all_feature_names
+            
             # Handle numerical features with imputation
             if available_features:
-                # Create imputer for numerical features
                 imputer_name = f'{target}_numerical_imputer'
                 if imputer_name not in self.imputers:
                     self.imputers[imputer_name] = SimpleImputer(strategy='median')
@@ -287,7 +301,7 @@ class F1PredictiveModels:
                 self.label_encoders[col].fit(unique_values)
                 X[col] = self.label_encoders[col].transform(X[col])
 
-            # Scale features
+            # Scale features with proper column tracking
             scaler_name = f'{target}_scaler'
             if scaler_name not in self.scalers:
                 self.scalers[scaler_name] = StandardScaler()
@@ -295,7 +309,8 @@ class F1PredictiveModels:
             else:
                 X_scaled = self.scalers[scaler_name].transform(X)
                 
-            X = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
+            # Create DataFrame with proper column names
+            X = pd.DataFrame(X_scaled, columns=all_feature_names, index=X.index)
             
             # Prepare target with cleaning
             y = data[target].dropna()
@@ -310,6 +325,7 @@ class F1PredictiveModels:
             X = X.loc[common_indices]
             y = y.loc[common_indices]
 
+            self.logger.info(f"Prepared {len(X)} samples with {len(all_feature_names)} features")
             return X, y
         
         except Exception as e:
@@ -318,11 +334,15 @@ class F1PredictiveModels:
 
     def _train_single_model_safe(self, model_name: str, X_train: pd.DataFrame, X_test: pd.DataFrame, 
                                 y_train: pd.Series, y_test: pd.Series) -> ModelPerformance:
-        """Train a single model with comprehensive error handling"""
+        """Train a single model with validation"""
         try:
             model = self.models[model_name]
 
-            # Check for NaN or infinite values before training
+            # Additional data validation
+            if len(X_train) < 20:
+                self.logger.warning(f"Very small training set for {model_name}: {len(X_train)} samples")
+            
+            # Check for NaN or infinite values
             if np.any(np.isnan(X_train)) or np.any(np.isinf(X_train)):
                 self.logger.error(f"X_train contains NaN or inf values for {model_name}")
                 return ModelPerformance(model_name, float('inf'), float('inf'), -1, float('inf'))
@@ -333,27 +353,43 @@ class F1PredictiveModels:
 
             # Train model
             model.fit(X_train, y_train)
+            
+            # CRITICAL: Store the trained model immediately after fitting
+            self.models[model_name] = model
+            self.logger.info(f"Trained model stored for {model_name}")
 
             # Make predictions
             y_pred = model.predict(X_test)
 
-            # Check predictions for validity
+            # Validate predictions
             if np.any(np.isnan(y_pred)) or np.any(np.isinf(y_pred)):
                 self.logger.error(f"Model {model_name} produced invalid predictions")
                 return ModelPerformance(model_name, float('inf'), float('inf'), -1, float('inf'))
 
-            # Cross-validation with error handling
+            # Cross-validation with proper error handling
             try:
-                cv_scores = cross_val_score(model, X_train, y_train, cv=min(5, len(X_train)//10), 
-                                          scoring='neg_mean_absolute_error')
-                cv_score = -cv_scores.mean() if len(cv_scores) > 0 else float('inf')
-            except:
+                cv_folds = min(5, len(X_train)//10, 10)  # Reasonable number of folds
+                if cv_folds >= 2:
+                    cv_scores = cross_val_score(model, X_train, y_train, cv=cv_folds, 
+                                              scoring='neg_mean_absolute_error')
+                    cv_score = -cv_scores.mean() if len(cv_scores) > 0 else float('inf')
+                else:
+                    cv_score = float('inf')
+            except Exception as cv_error:
+                self.logger.warning(f"Cross-validation failed for {model_name}: {cv_error}")
                 cv_score = float('inf')
 
             # Calculate metrics
             mae = mean_absolute_error(y_test, y_pred)
             rmse = np.sqrt(mean_squared_error(y_test, y_pred))
             r2 = r2_score(y_test, y_pred)
+
+            # Validate that metrics are reasonable for F1 data
+            if mae < 0.01:  # Less than 10ms error is suspiciously good
+                self.logger.warning(f"{model_name} has suspiciously low MAE: {mae:.4f}s - possible data leakage!")
+            
+            if r2 > 0.99:  # Perfect R² is suspicious
+                self.logger.warning(f"{model_name} has suspiciously high R²: {r2:.4f} - possible overfitting!")
 
             performance = ModelPerformance(
                 model_name=model_name, 
@@ -377,12 +413,30 @@ class F1PredictiveModels:
         Predict lap time with improved error handling and fallbacks
         """
         try:
-            # Load best model if not already loaded
+            # Get best model name
             best_model_name = self._get_best_model_name()
-            if best_model_name not in self.models:
+            
+            # Always try to load model if available
+            model_path = self.model_dir / f"{best_model_name}.joblib"
+            if model_path.exists():
                 self._load_model(best_model_name)
+            
+            # Check if model is available and trained
+            if best_model_name in self.models:
+                model = self.models[best_model_name]
                 
-            if best_model_name not in self.models:
+                # Verify the model is fitted
+                if isinstance(model, (RandomForestRegressor, GradientBoostingRegressor)):
+                    if not hasattr(model, 'estimators_') or model.estimators_ is None or len(model.estimators_) == 0:
+                        self.logger.error(f"Model {best_model_name} is not trained (tree-based)")
+                        return None
+                elif isinstance(model, LinearRegression):
+                    if not hasattr(model, 'coef_'):
+                        self.logger.error(f"Model {best_model_name} is not trained (linear)")
+                        return None
+                else:
+                    self.logger.warning(f"Unknown model type: {type(model)}")
+            else:
                 self.logger.error("No trained model available")
                 return None
             
@@ -406,8 +460,18 @@ class F1PredictiveModels:
                 return None
             
             # Make prediction with the best model
-            model = self.models[best_model_name]
-            predicted_time = model.predict([feature_vector])[0]
+            # Use DataFrame for prediction to maintain feature names
+            if 'lap_time' in self.feature_names and self.feature_names['lap_time']:
+                try:
+                    feature_df = pd.DataFrame([feature_vector], 
+                                             columns=self.feature_names['lap_time'])
+                    predicted_time = model.predict(feature_df)[0]
+                except Exception as e:
+                    self.logger.warning(f"DataFrame prediction failed: {e}")
+                    predicted_time = model.predict([feature_vector])[0]
+            else:
+                self.logger.warning("Using array prediction without feature names")
+                predicted_time = model.predict([feature_vector])[0]
             
             # Validate prediction
             if np.isnan(predicted_time) or np.isinf(predicted_time) or predicted_time <= 0:
@@ -446,6 +510,414 @@ class F1PredictiveModels:
         except Exception as e:
             self.logger.error(f"Error predicting lap time: {e}")
             return None
+
+    def predict_tire_degradation(self, session_id: str, driver_code: str, 
+                                tire_compound: str, stint_length: int,
+                                initial_pace: float, avg_track_temp: float) -> Optional[float]:
+        """
+        Predict tire degradation rate for a given stint
+        """
+        try:
+            model_name = 'tire_degradation'
+            
+            # First try to load the model
+            if model_name not in self.models:
+                self._load_model(model_name)
+                
+            # Check if model is loaded and trained
+            model_available = (
+                model_name in self.models and 
+                hasattr(self.models[model_name], 'estimators_') and
+                self.models[model_name].estimators_ is not None and
+                len(self.models[model_name].estimators_) > 0
+            )
+            
+            # Train model if not available
+            if not model_available:
+                self.logger.info("Training tire degradation model on demand...")
+                self.train_tire_degradation_model([session_id])
+                
+                # Reload after training
+                if model_name not in self.models:
+                    self._load_model(model_name)
+                    
+            # Final check before prediction
+            if model_name not in self.models or not hasattr(self.models[model_name], 'estimators_'):
+                self.logger.error("Tire degradation model not available after training")
+                return None
+                
+            model = self.models[model_name]
+            
+            # Build feature vector
+            features = {
+                'stint_length': stint_length,
+                'avg_track_temp': avg_track_temp,
+                'initial_pace': initial_pace,
+                'tire_compound': tire_compound,
+                'driver_code': driver_code
+            }
+            
+            # Preprocess features
+            feature_df = self._prepare_degradation_features_safe(features)
+            if feature_df is None:
+                return None
+
+            # Predict using DataFrame
+            degradation_rate = model.predict(feature_df)[0]
+            return degradation_rate
+            
+        except Exception as e:
+            self.logger.error(f"Error predicting tire degradation: {e}")
+            return None
+
+    def _prepare_degradation_features_safe(self, features: Dict[str, Any]) -> Optional[np.ndarray]:
+        """Prepare degradation features safely with proper DataFrame handling"""
+        try:
+            # Get expected feature names
+            expected_features = self.feature_names.get('degradation', [
+                'stint_length', 'avg_track_temp', 'avg_air_temp', 
+                'initial_pace', 'tire_compound', 'driver_code'
+            ])
+            
+            # Create ordered feature vector
+            feature_vector = []
+            for feature_name in expected_features:
+                if feature_name in features:
+                    # Handle numerical features
+                    if feature_name in ['stint_length', 'avg_track_temp', 'avg_air_temp', 'initial_pace']:
+                        feature_vector.append(float(features[feature_name]))
+                    
+                    # Handle categorical features
+                    elif feature_name in ['tire_compound', 'driver_code']:
+                        if feature_name in self.label_encoders:
+                            encoder = self.label_encoders[feature_name]
+                            value = str(features[feature_name])
+                            if value in encoder.classes_:
+                                encoded_value = encoder.transform([value])[0]
+                            else:
+                                encoded_value = 0
+                            feature_vector.append(float(encoded_value))
+                        else:
+                            feature_vector.append(0.0)
+                else:
+                    feature_vector.append(0.0)
+
+            feature_df = pd.DataFrame([feature_vector], columns=expected_features)       
+            # Apply scaling if available - FIXED WITH PROPER DATAFRAME
+            if 'degradation_scaler' in self.scalers:
+                scaler = self.scalers['degradation_scaler']
+                try:
+                    # Scale using DataFrame to preserve feature names
+                    scaled_features = scaler.transform(feature_df)
+                    return pd.DataFrame(scaled_features, columns=expected_features)
+                except Exception as e:
+                    self.logger.warning(f"Scaling failed: {e}")
+                    return feature_df
+            else:
+                return feature_df
+            
+        except Exception as e:
+            self.logger.error(f"Error preparing degradation features: {e}")
+            return None
+
+    def train_tire_degradation_model(self, session_ids: List[str]) -> ModelPerformance:
+        """Train tire degradation model safely with feature name storage"""
+        try:
+            self.logger.info("Training tire degradation model")
+            data = self.prepare_tire_degradation_features(session_ids)
+
+            if data.empty:
+                self.logger.error('No data available for tire degradation training')
+                return ModelPerformance('tire_degradation', float('inf'), float('inf'), -1, float('inf'))
+            
+            # Prepare features
+            X, y = self._prepare_degradation_model_data_safe(data)
+
+            if X.empty or len(y) == 0:
+                self.logger.error('No valid features for degradation training')
+                return ModelPerformance('tire_degradation', float('inf'), float('inf'), -1, float('inf'))
+            
+            # Clean data
+            mask = ~(np.isnan(X).any(axis=1) | np.isnan(y) | np.isinf(X).any(axis=1) | np.isinf(y))
+            X = X[mask]
+            y = y[mask]
+            
+            if len(X) < 5:
+                self.logger.error('Insufficient clean data for degradation training')
+                return ModelPerformance('tire_degradation', float('inf'), float('inf'), -1, float('inf'))
+            
+            # Split and train
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            performance = self._train_single_model_safe('tire_degradation', X_train, X_test, y_train, y_test)
+            
+            if performance.mae != float('inf'):
+                # Save model with feature names
+                self._save_model('tire_degradation', X.columns.tolist())
+                
+                # Store feature names specifically for degradation predictions
+                self.feature_names['degradation'] = X.columns.tolist()
+                self.logger.info(f"Stored degradation feature names: {X.columns.tolist()}")
+                
+                # Load the newly trained model into memory
+                self._load_model('tire_degradation')
+                
+                # Verify model is ready
+                if 'tire_degradation' in self.models and hasattr(self.models['tire_degradation'], 'estimators_'):
+                    self.logger.info("Tire degradation model successfully trained and loaded")
+                else:
+                    self.logger.warning("Newly trained model not loaded properly")
+
+            return performance
+            
+        except Exception as e:
+            self.logger.error(f"Error training tire degradation model: {e}")
+            return ModelPerformance('tire_degradation', float('inf'), float('inf'), -1, float('inf'))
+
+    def _prepare_degradation_model_data_safe(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+        """Prepare degradation model data safely"""
+        try:
+            feature_columns = ['stint_length', 'avg_track_temp', 'avg_air_temp', 'initial_pace']
+            categorical_columns = ['tire_compound', 'driver_code']
+
+            # Check columns exist
+            missing_cols = [col for col in feature_columns + categorical_columns if col not in data.columns]
+            if missing_cols:
+                self.logger.error(f"Missing columns: {missing_cols}")
+                return pd.DataFrame(), pd.Series()
+
+            X = data[feature_columns + categorical_columns].copy()
+            
+            # Handle numerical features
+            if 'degradation_numerical_imputer' not in self.imputers:
+                self.imputers['degradation_numerical_imputer'] = SimpleImputer(strategy='median')
+            
+            X[feature_columns] = self.imputers['degradation_numerical_imputer'].fit_transform(X[feature_columns])
+            
+            # Encode categorical variables safely
+            for col in categorical_columns:
+                if col not in self.label_encoders:
+                    self.label_encoders[col] = LabelEncoder()
+                X[col] = X[col].fillna('Unknown').astype(str)
+                X[col] = self.label_encoders[col].fit_transform(X[col])
+            
+            # Scale features
+            if 'degradation_scaler' not in self.scalers:
+                self.scalers['degradation_scaler'] = StandardScaler()
+                X_scaled = self.scalers['degradation_scaler'].fit_transform(X)
+            else:
+                X_scaled = self.scalers['degradation_scaler'].transform(X)
+            
+            X = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
+            y = data['degradation_rate'].dropna()
+            
+            # Align indices
+            common_indices = X.index.intersection(y.index)
+            X = X.loc[common_indices]
+            y = y.loc[common_indices]
+            
+            return X, y
+        
+        except Exception as e:
+            self.logger.error(f"Error preparing degradation model data: {e}")
+            return pd.DataFrame(), pd.Series()
+
+    def prepare_tire_degradation_features(self, session_ids: List[str]) -> pd.DataFrame:
+        """Prepare tire degradation features safely"""
+        try:
+            with db_pool.get_connection() as conn:
+                session_placeholders = ','.join(['?' for _ in session_ids])
+                query = f"""
+                    SELECT 
+                        l.driver_code,
+                        COALESCE(l.tire_compound, 'MEDIUM') as tire_compound,
+                        COALESCE(l.tire_age, 1) as tire_age,
+                        l.lap_time,
+                        l.lap_number,
+                        COALESCE(s.air_temp, 25.0) as air_temp,
+                        COALESCE(s.track_temp, 35.0) as track_temp,
+                        l.session_id
+                    FROM lap_times l
+                    JOIN sessions s ON l.session_id = s.session_id
+                    WHERE l.session_id IN ({session_placeholders})
+                    AND COALESCE(l.deleted, 0) = 0
+                    AND l.lap_time IS NOT NULL
+                    AND l.lap_time BETWEEN 60 AND 120
+                    AND l.tire_age > 0
+                    ORDER BY l.session_id, l.driver_code, l.lap_number
+                """
+
+                data = pd.read_sql_query(query, conn, params=tuple(session_ids))
+
+                if data.empty:
+                    return pd.DataFrame()
+
+                # Calculate degradation features safely
+                degradation_data = []
+                
+                for (session_id, driver, compound), group in data.groupby(['session_id', 'driver_code', 'tire_compound']):
+                    if len(group) < 3:
+                        continue
+                    
+                    group = group.sort_values('lap_number')
+                    
+                    # Safe degradation calculation
+                    try:
+                        initial_pace = group['lap_time'].iloc[:3].mean()
+                        final_pace = group['lap_time'].iloc[-3:].mean()
+                        stint_length = len(group)
+                        
+                        if stint_length > 1 and not np.isnan(initial_pace) and not np.isnan(final_pace):
+                            degradation_rate = (final_pace - initial_pace) / stint_length
+                        else:
+                            degradation_rate = 0.0
+                        
+                        degradation_data.append({
+                            'driver_code': driver,
+                            'tire_compound': compound,
+                            'stint_length': stint_length,
+                            'initial_pace': initial_pace,
+                            'degradation_rate': degradation_rate,
+                            'avg_air_temp': group['air_temp'].mean(),
+                            'avg_track_temp': group['track_temp'].mean(),
+                            'session_id': session_id
+                        })
+                    except:
+                        continue
+
+                if degradation_data:
+                    result_df = pd.DataFrame(degradation_data)
+                    # Remove any rows with NaN values
+                    result_df = result_df.dropna()
+                    self.logger.info(f'Prepared {len(result_df)} degradation records')
+                    return result_df
+                else:
+                    return pd.DataFrame()
+
+        except Exception as e:
+            self.logger.error(f'Error preparing tire degradation features: {e}')
+            return pd.DataFrame()
+
+    def _load_model(self, model_name: str):
+        """Load saved model with complete metadata and validate it's trained"""
+        try:
+            model_path = self.model_dir / f"{model_name}.joblib"
+            scaler_path = self.model_dir / f"{model_name}_scaler.joblib"
+            encoder_path = self.model_dir / f"{model_name}_encoders.joblib"
+            imputer_path = self.model_dir / f"{model_name}_imputers.joblib"
+            metadata_path = self.model_dir / f"{model_name}_metadata.joblib"
+            
+            if model_path.exists():
+                try:
+                    # Load model
+                    loaded_model = joblib.load(model_path)
+                    
+                    # Validate model is trained
+                    valid_model = False
+                    if isinstance(loaded_model, RandomForestRegressor):
+                        valid_model = hasattr(loaded_model, 'estimators_') and loaded_model.estimators_ is not None and len(loaded_model.estimators_) > 0
+                    elif isinstance(loaded_model, GradientBoostingRegressor):
+                        valid_model = hasattr(loaded_model, 'estimators_') and loaded_model.estimators_ is not None and len(loaded_model.estimators_) > 0
+                    elif isinstance(loaded_model, LinearRegression):
+                        valid_model = hasattr(loaded_model, 'coef_')
+                    else:
+                        valid_model = True  # Unknown model type, assume valid
+                    
+                    if not valid_model:
+                        self.logger.warning(f"Model {model_name} loaded but not trained - skipping")
+                        return
+                    
+                    # Only store if valid
+                    self.models[model_name] = loaded_model
+                    self.logger.info(f"Model {model_name} loaded successfully")
+                    
+                    # Load metadata
+                    if metadata_path.exists():
+                        metadata = joblib.load(metadata_path)
+                        if model_name.startswith('lap_time_'):
+                            self.feature_names['lap_time'] = metadata.get('feature_order', [])
+                        elif model_name == 'tire_degradation':
+                            self.feature_names['degradation'] = metadata.get('feature_order', [])
+                    
+                    # Load scalers
+                    if scaler_path.exists():
+                        loaded_scalers = joblib.load(scaler_path)
+                        self.scalers.update(loaded_scalers)
+                        self.logger.info(f"Loaded scalers for {model_name}")
+                        
+                    # Load encoders
+                    if encoder_path.exists():
+                        loaded_encoders = joblib.load(encoder_path)
+                        self.label_encoders.update(loaded_encoders)
+                        self.logger.info(f"Loaded encoders for {model_name}")
+                    
+                    # Load imputers
+                    if imputer_path.exists():
+                        loaded_imputers = joblib.load(imputer_path)
+                        self.imputers.update(loaded_imputers)
+                        self.logger.info(f"Loaded imputers for {model_name}")
+                        
+                except Exception as load_error:
+                    self.logger.error(f"Error loading model {model_name}: {load_error}")
+            else:
+                self.logger.warning(f"Model file not found: {model_path}")
+                
+        except Exception as e:
+            self.logger.error(f"Error loading model {model_name}: {e}")
+
+    def _save_model(self, model_name: str, feature_names: List[str]):
+        """Save trained model with complete metadata"""
+        try:
+            model_path = self.model_dir / f"{model_name}.joblib"
+            scaler_path = self.model_dir / f"{model_name}_scaler.joblib"
+            encoder_path = self.model_dir / f"{model_name}_encoders.joblib"
+            imputer_path = self.model_dir / f"{model_name}_imputers.joblib"
+            metadata_path = self.model_dir / f"{model_name}_metadata.joblib"
+
+            # Save model
+            joblib.dump(self.models[model_name], model_path)
+
+            # Save scalers
+            relevant_scalers = {k: v for k, v in self.scalers.items() if model_name.split('_')[0] in k}
+            if relevant_scalers:
+                joblib.dump(relevant_scalers, scaler_path)
+
+            # Save encoders
+            if self.label_encoders:
+                joblib.dump(self.label_encoders, encoder_path)
+
+            # Save imputers
+            relevant_imputers = {k: v for k, v in self.imputers.items() if model_name.split('_')[0] in k}
+            if relevant_imputers:
+                joblib.dump(relevant_imputers, imputer_path)
+
+            # Save comprehensive metadata
+            metadata = {
+                'feature_names': feature_names,
+                'feature_order': feature_names,  # Explicit feature order
+                'model_type': type(self.models[model_name]).__name__,
+                'trained_at': pd.Timestamp.now().isoformat(),
+                'n_features': len(feature_names),
+                'expected_feature_names': self.feature_names.get(model_name.split('_')[0], feature_names)
+            }
+            joblib.dump(metadata, metadata_path)
+
+            self.logger.info(f"Model {model_name} saved successfully with {len(feature_names)} features")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving model {model_name}: {e}")
+
+    def _get_best_model_name(self) -> str:
+        """Get the name of the best performing model"""
+        best_model_file = self.model_dir / "best_model_name.txt"
+        
+        if best_model_file.exists():
+            try:
+                with open(best_model_file, 'r') as f:
+                    return f.read().strip()
+            except:
+                pass
+        
+        return 'lap_time_rf'  # Default fallback
 
     def _get_session_context_safe(self, session_id: str) -> Dict[str, Any]:
         """Retrieve session context with safe defaults"""
@@ -549,251 +1021,153 @@ class F1PredictiveModels:
             return {'has_history': False}
 
     def _build_prediction_features_safe(self, session_id: str, driver_code: str, 
-                                      lap_number: int, tire_compound: str, tire_age: int,
-                                      session_context: Dict[str, Any], 
-                                      driver_history: Dict[str, Any], **kwargs) -> Optional[np.ndarray]:
-        """Build feature vector with comprehensive error handling"""
+                                  lap_number: int, tire_compound: str, tire_age: int,
+                                  session_context: Dict[str, Any], 
+                                  driver_history: Dict[str, Any], **kwargs) -> Optional[np.ndarray]:
+        """Build feature vector with proper feature alignment and DataFrame handling"""
         try:
-            # Base features with safe defaults
-            features = {
-                'lap_number': float(lap_number),
-                'tire_age': float(tire_age),
-                'air_temp': float(session_context.get('air_temp', 25.0)),
-                'track_temp': float(session_context.get('track_temp', 35.0)),
-                'humidity': float(session_context.get('humidity', 60.0)),
-            }
+            # Get the stored feature names for lap_time model
+            expected_features = self.feature_names.get('lap_time', [])
             
-            # Add weather-derived features
-            features['temp_difference'] = features['track_temp'] - features['air_temp']
+            if not expected_features:
+                self.logger.warning("No stored feature names found - using fallback")
+                expected_features = [
+                    'lap_number', 'tire_age', 'position', 'air_temp', 'track_temp', 
+                    'humidity', 'prev_lap_time', 'lap_time_trend', 'stint_lap',
+                    'position_change', 'temp_difference', 'driver_form', 'relative_pace',
+                    'compound_historical_pace', 'speed_i1', 'speed_i2', 'speed_fl',
+                    'tire_compound', 'session_type', 'circuit_name', 'driver_code'
+                ]
             
-            # Driver performance features with safe defaults
-            avg_pace = session_context.get('session_avg_pace', 90.0)
+            # Build features dictionary matching expected features
+            features_dict = {}
             
+            # Numerical features
+            features_dict['lap_number'] = float(lap_number)
+            features_dict['tire_age'] = float(tire_age)
+            features_dict['air_temp'] = float(session_context.get('air_temp', 25.0))
+            features_dict['track_temp'] = float(session_context.get('track_temp', 35.0))
+            features_dict['humidity'] = float(session_context.get('humidity', 60.0))
+            features_dict['position'] = float(kwargs.get('position', 10))
+            
+            # Weather derived
+            features_dict['temp_difference'] = features_dict['track_temp'] - features_dict['air_temp']
+            
+            # Driver history features
             if driver_history.get('has_history', False):
-                features.update({
-                    'prev_lap_time': driver_history.get('prev_lap_time', avg_pace),
-                    'driver_form': driver_history.get('avg_recent_pace', avg_pace),
-                    'position': float(driver_history.get('current_position', 10)),
-                    'stint_lap': float(driver_history.get('stint_length', tire_age)),
-                })
-                
-                # Pace trend
-                prev_lap = features['prev_lap_time']
-                if prev_lap and not np.isnan(prev_lap):
-                    features['lap_time_trend'] = prev_lap - features['driver_form']
-                else:
-                    features['lap_time_trend'] = 0.0
-                    
-                # Position change
-                features['position_change'] = float(driver_history.get('position_trend', 0.0))
+                features_dict['prev_lap_time'] = driver_history.get('prev_lap_time', session_context.get('session_avg_pace', 90.0))
+                features_dict['driver_form'] = driver_history.get('avg_recent_pace', session_context.get('session_avg_pace', 90.0))
+                features_dict['lap_time_trend'] = driver_history.get('pace_trend', 0.0)
+                features_dict['position_change'] = driver_history.get('position_trend', 0.0)
+                features_dict['stint_lap'] = driver_history.get('stint_length', tire_age)
             else:
-                # Use session averages for new drivers
-                features.update({
-                    'prev_lap_time': avg_pace,
-                    'driver_form': avg_pace,
-                    'lap_time_trend': 0.0,
-                    'position': float(kwargs.get('position', 10)),
-                    'stint_lap': float(tire_age),
-                    'position_change': 0.0
-                })
+                # Safe defaults
+                avg_pace = session_context.get('session_avg_pace', 90.0)
+                features_dict['prev_lap_time'] = avg_pace
+                features_dict['driver_form'] = avg_pace
+                features_dict['lap_time_trend'] = 0.0
+                features_dict['position_change'] = 0.0
+                features_dict['stint_lap'] = float(tire_age)
             
-            # Sector times (estimated if not provided)
-            sector_perf = driver_history.get('sector_performance', {})
-            features.update({
-                'sector_1_time': sector_perf.get('sector_1', features['prev_lap_time'] * 0.35),
-                'sector_2_time': sector_perf.get('sector_2', features['prev_lap_time'] * 0.35), 
-                'sector_3_time': sector_perf.get('sector_3', features['prev_lap_time'] * 0.30),
-            })
+            # Relative pace features
+            features_dict['relative_pace'] = features_dict['prev_lap_time'] - session_context.get('session_avg_pace', 90.0)
+            features_dict['compound_historical_pace'] = 0.0  # Default, would need historical data
             
-            # Speed trap estimates
-            features.update({
-                'speed_i1': float(kwargs.get('speed_i1', 280.0)),
-                'speed_i2': float(kwargs.get('speed_i2', 290.0)),
-                'speed_fl': float(kwargs.get('speed_fl', 310.0)),
-            })
+            # Speed features if available
+            if 'speed_i1' in expected_features:
+                features_dict['speed_i1'] = float(kwargs.get('speed_i1', 280.0))
+            if 'speed_i2' in expected_features:
+                features_dict['speed_i2'] = float(kwargs.get('speed_i2', 290.0))
+            if 'speed_fl' in expected_features:
+                features_dict['speed_fl'] = float(kwargs.get('speed_fl', 310.0))
             
-            # Compound relative pace with safe calculation
-            compound_avg = self._get_compound_average_pace_safe(session_id, tire_compound)
-            features['compound_relative_pace'] = features['prev_lap_time'] - compound_avg
-            
-            # Categorical features
-            categorical_features = {
+            # Categorical features (will be encoded)
+            categorical_values = {
                 'tire_compound': str(tire_compound),
                 'session_type': str(session_context.get('session_type', 'R')),
                 'circuit_name': str(session_context.get('circuit_name', 'Unknown')),
                 'driver_code': str(driver_code)
             }
             
-            # Convert to feature vector using safe preprocessing
-            feature_vector = self._encode_and_scale_features_safe(features, categorical_features)
+            # Create feature vector in the correct order matching training
+            feature_vector = []
+            feature_names_ordered = []
             
-            return feature_vector
+            for feature_name in expected_features:
+                if feature_name in features_dict:
+                    # Numerical feature
+                    feature_vector.append(features_dict[feature_name])
+                    feature_names_ordered.append(feature_name)
+                elif feature_name in categorical_values:
+                    # Categorical feature - encode it
+                    if feature_name in self.label_encoders:
+                        encoder = self.label_encoders[feature_name]
+                        try:
+                            value = categorical_values[feature_name]
+                            if str(value) in encoder.classes_:
+                                encoded_value = encoder.transform([str(value)])[0]
+                            else:
+                                encoded_value = 0  # Fallback for unseen categories
+                            feature_vector.append(float(encoded_value))
+                            feature_names_ordered.append(feature_name)
+                        except:
+                            feature_vector.append(0.0)
+                            feature_names_ordered.append(feature_name)
+                    else:
+                        feature_vector.append(0.0)
+                        feature_names_ordered.append(feature_name)
+                else:
+                    # Unknown feature - use 0
+                    feature_vector.append(0.0)
+                    feature_names_ordered.append(feature_name)
+            
+            feature_array = np.array(feature_vector)
+            
+            # Apply scaling with proper DataFrame to maintain feature names and fix warnings
+            if 'lap_time_scaler' in self.scalers:
+                scaler = self.scalers['lap_time_scaler']
+                try:
+                    # Create DataFrame with proper feature names to avoid sklearn warnings
+                    feature_df = pd.DataFrame([feature_array], columns=feature_names_ordered)
+                    scaled_features = scaler.transform(feature_df)
+                    return scaled_features[0]
+                except Exception as e:
+                    self.logger.warning(f"Scaling with DataFrame failed: {e}")
+                    # Fallback to array scaling
+                    try:
+                        scaled_features = scaler.transform([feature_array])
+                        return scaled_features[0]
+                    except Exception as e2:
+                        self.logger.warning(f"Array scaling also failed: {e2}")
+                        return feature_array
+            
+            return feature_array
             
         except Exception as e:
             self.logger.error(f"Error building prediction features: {e}")
             return None
 
-    def _encode_and_scale_features_safe(self, features: Dict[str, Any], 
-                                      categorical_features: Dict[str, str]) -> Optional[np.ndarray]:
-        """Encode categorical features and scale all features safely"""
-        try:
-            # Combine all features
-            all_features = {**features, **categorical_features}
-            
-            # Create DataFrame with single row
-            feature_df = pd.DataFrame([all_features])
-            
-            # Encode categorical features safely
-            for col, value in categorical_features.items():
-                if col in self.label_encoders:
-                    encoder = self.label_encoders[col]
-                    try:
-                        # Handle unseen categories gracefully
-                        if str(value) in encoder.classes_:
-                            encoded_value = encoder.transform([str(value)])[0]
-                        else:
-                            # Use most frequent class or 0 as fallback
-                            encoded_value = 0
-                        feature_df[col] = encoded_value
-                    except:
-                        feature_df[col] = 0
-                else:
-                    # If encoder doesn't exist, use simple mapping
-                    feature_df[col] = 0
-            
-            # Apply imputation if available
-            numeric_cols = [col for col in features.keys()]
-            if 'lap_time_numerical_imputer' in self.imputers:
-                try:
-                    feature_df[numeric_cols] = self.imputers['lap_time_numerical_imputer'].transform(feature_df[numeric_cols])
-                except:
-                    # Fill with medians if imputer fails
-                    feature_df[numeric_cols] = feature_df[numeric_cols].fillna(feature_df[numeric_cols].median())
-            
-            # Scale features
-            if 'lap_time_scaler' in self.scalers:
-                scaler = self.scalers['lap_time_scaler']
-                try:
-                    scaled_features = scaler.transform(feature_df)
-                    return scaled_features[0]
-                except Exception as scale_error:
-                    self.logger.warning(f"Scaling failed, using normalized features: {scale_error}")
-                    # Fallback: simple normalization
-                    numeric_data = feature_df.select_dtypes(include=[np.number]).values[0]
-                    mean_val = np.nanmean(numeric_data)
-                    std_val = np.nanstd(numeric_data)
-                    if std_val > 0:
-                        return (numeric_data - mean_val) / std_val
-                    else:
-                        return numeric_data
-            else:
-                return feature_df.values[0]
-                
-        except Exception as e:
-            self.logger.error(f"Error encoding features: {e}")
-            # Return a safe default feature vector
-            return np.zeros(15)
-
-    # Helper methods with safe implementations
-    def _calculate_pace_trend_safe(self, history: pd.DataFrame) -> float:
-        """Calculate pace trend safely"""
-        try:
-            if len(history) < 3:
-                return 0.0
-            
-            recent_laps = history.head(3)['lap_time'].values
-            older_laps = history.tail(3)['lap_time'].values
-            
-            if len(recent_laps) > 0 and len(older_laps) > 0:
-                return float(np.nanmean(older_laps) - np.nanmean(recent_laps))
-            return 0.0
-        except:
-            return 0.0
-
-    def _calculate_position_trend_safe(self, history: pd.DataFrame) -> float:
-        """Calculate position change trend safely"""
-        try:
-            if len(history) < 2:
-                return 0.0
-            return float(history.iloc[-1]['position'] - history.iloc[0]['position'])
-        except:
-            return 0.0
-
-    def _calculate_current_stint_length_safe(self, history: pd.DataFrame) -> int:
-        """Calculate current stint length safely"""
-        try:
-            if history.empty:
-                return 1
-            
-            current_compound = history.iloc[0]['tire_compound']
-            stint_length = 0
-            
-            for _, lap in history.iterrows():
-                if lap['tire_compound'] == current_compound:
-                    stint_length += 1
-                else:
-                    break
-            
-            return max(stint_length, 1)
-        except:
-            return 1
-
-    def _analyze_sector_performance_safe(self, recent_laps: pd.DataFrame) -> Dict[str, float]:
-        """Analyze sector performance safely"""
-        try:
-            if recent_laps.empty:
-                return {}
-            
-            result = {}
-            for sector in ['sector_1_time', 'sector_2_time', 'sector_3_time']:
-                if sector in recent_laps.columns:
-                    sector_data = recent_laps[sector].dropna()
-                    if not sector_data.empty:
-                        result[sector.replace('_time', '')] = float(sector_data.mean())
-                    else:
-                        result[sector.replace('_time', '')] = 0.0
-                else:
-                    result[sector.replace('_time', '')] = 0.0
-            
-            return result
-        except:
-            return {}
-
-    def _get_compound_average_pace_safe(self, session_id: str, tire_compound: str) -> float:
-        """Get compound average pace safely"""
-        try:
-            with db_pool.get_connection() as conn:
-                query = """
-                    SELECT AVG(lap_time) as avg_pace
-                    FROM lap_times
-                    WHERE session_id = ? 
-                        AND tire_compound = ?
-                        AND COALESCE(deleted, 0) = 0
-                        AND lap_time BETWEEN 60 AND 120
-                """
-                
-                result = pd.read_sql_query(query, conn, params=(session_id, tire_compound))
-                
-                if not result.empty and result.iloc[0]['avg_pace'] is not None:
-                    return float(result.iloc[0]['avg_pace'])
-                else:
-                    return 90.0  # Fallback average
-                    
-        except Exception as e:
-            self.logger.error(f"Error getting compound average: {e}")
-            return 90.0
-
     def _calculate_confidence_interval_safe(self, feature_vector: np.ndarray, 
-                                          prediction: float, model_name: str) -> Tuple[float, float]:
-        """Calculate confidence interval safely"""
+                                      prediction: float, model_name: str) -> Tuple[float, float]:
+        """Calculate confidence interval safely with proper DataFrame handling"""
         try:
             predictions = []
+            
+            # Get the expected feature names for proper DataFrame creation
+            expected_features = self.feature_names.get('lap_time', [])
             
             # Get predictions from available models
             for name, model in self.models.items():
                 if name.startswith('lap_time_') and hasattr(model, 'predict'):
                     try:
-                        pred = model.predict([feature_vector])[0]
+                        # Create DataFrame with proper feature names to avoid warnings
+                        if expected_features and len(expected_features) == len(feature_vector):
+                            feature_df = pd.DataFrame([feature_vector], columns=expected_features)
+                            pred = model.predict(feature_df)[0]
+                        else:
+                            # Fallback to array if feature names don't match
+                            pred = model.predict([feature_vector])[0]
+                        
                         if not (np.isnan(pred) or np.isinf(pred)):
                             predictions.append(pred)
                     except:
@@ -886,254 +1260,94 @@ class F1PredictiveModels:
             self.logger.error(f"Error applying racing adjustments: {e}")
             return max(predicted_time, 60.0)
 
-    def _get_best_model_name(self) -> str:
-        """Get the name of the best performing model"""
-        best_model_file = self.model_dir / "best_model_name.txt"
-        
-        if best_model_file.exists():
-            try:
-                with open(best_model_file, 'r') as f:
-                    return f.read().strip()
-            except:
-                pass
-        
-        return 'lap_time_rf'  # Default fallback
-
-    def _save_model(self, model_name: str, feature_names: List[str]):
-        """Save trained model with metadata"""
+    # Helper methods with safe implementations
+    def _calculate_pace_trend_safe(self, history: pd.DataFrame) -> float:
+        """Calculate pace trend safely"""
         try:
-            model_path = self.model_dir / f"{model_name}.joblib"
-            scaler_path = self.model_dir / f"{model_name}_scaler.joblib"
-            encoder_path = self.model_dir / f"{model_name}_encoders.joblib"
-            imputer_path = self.model_dir / f"{model_name}_imputers.joblib"
-            metadata_path = self.model_dir / f"{model_name}_metadata.joblib"
-
-            # Save model
-            joblib.dump(self.models[model_name], model_path)
-
-            # Save scalers
-            relevant_scalers = {k: v for k, v in self.scalers.items() if model_name.split('_')[0] in k}
-            if relevant_scalers:
-                joblib.dump(relevant_scalers, scaler_path)
-
-            # Save encoders
-            if self.label_encoders:
-                joblib.dump(self.label_encoders, encoder_path)
-
-            # Save imputers
-            relevant_imputers = {k: v for k, v in self.imputers.items() if model_name.split('_')[0] in k}
-            if relevant_imputers:
-                joblib.dump(relevant_imputers, imputer_path)
-
-            # Save metadata
-            metadata = {
-                'feature_names': feature_names,
-                'model_type': type(self.models[model_name]).__name__,
-                'trained_at': pd.Timestamp.now().isoformat(),
-                'n_features': len(feature_names)
-            }
-            joblib.dump(metadata, metadata_path)
-
-            self.logger.info(f"Model {model_name} saved successfully")
+            if len(history) < 3:
+                return 0.0
             
-        except Exception as e:
-            self.logger.error(f"Error saving model {model_name}: {e}")
+            recent_laps = history.head(3)['lap_time'].values
+            older_laps = history.tail(3)['lap_time'].values
+            
+            if len(recent_laps) > 0 and len(older_laps) > 0:
+                return float(np.nanmean(older_laps) - np.nanmean(recent_laps))
+            return 0.0
+        except:
+            return 0.0
 
-    def _load_model(self, model_name: str):
-        """Load saved model and metadata"""
+    def _calculate_position_trend_safe(self, history: pd.DataFrame) -> float:
+        """Calculate position change trend safely"""
         try:
-            model_path = self.model_dir / f"{model_name}.joblib"
-            scaler_path = self.model_dir / f"{model_name}_scaler.joblib"
-            encoder_path = self.model_dir / f"{model_name}_encoders.joblib"
-            imputer_path = self.model_dir / f"{model_name}_imputers.joblib"
-            
-            if model_path.exists():
-                self.models[model_name] = joblib.load(model_path)
-                self.logger.info(f"Model {model_name} loaded successfully")
-                
-                # Load scalers
-                if scaler_path.exists():
-                    loaded_scalers = joblib.load(scaler_path)
-                    self.scalers.update(loaded_scalers)
-                    
-                # Load encoders
-                if encoder_path.exists():
-                    loaded_encoders = joblib.load(encoder_path)
-                    self.label_encoders.update(loaded_encoders)
-                
-                # Load imputers
-                if imputer_path.exists():
-                    loaded_imputers = joblib.load(imputer_path)
-                    self.imputers.update(loaded_imputers)
-                    
-            else:
-                self.logger.warning(f"Model {model_name} not found at {model_path}")
-                
-        except Exception as e:
-            self.logger.error(f"Error loading model {model_name}: {e}")
+            if len(history) < 2:
+                return 0.0
+            return float(history.iloc[-1]['position'] - history.iloc[0]['position'])
+        except:
+            return 0.0
 
-    # Tire degradation methods (simplified for space)
-    def prepare_tire_degradation_features(self, session_ids: List[str]) -> pd.DataFrame:
-        """Prepare tire degradation features safely"""
+    def _calculate_current_stint_length_safe(self, history: pd.DataFrame) -> int:
+        """Calculate current stint length safely"""
+        try:
+            if history.empty:
+                return 1
+            
+            current_compound = history.iloc[0]['tire_compound']
+            stint_length = 0
+            
+            for _, lap in history.iterrows():
+                if lap['tire_compound'] == current_compound:
+                    stint_length += 1
+                else:
+                    break
+            
+            return max(stint_length, 1)
+        except:
+            return 1
+
+    def _analyze_sector_performance_safe(self, recent_laps: pd.DataFrame) -> Dict[str, float]:
+        """Analyze sector performance safely"""
+        try:
+            if recent_laps.empty:
+                return {}
+            
+            result = {}
+            for sector in ['sector_1_time', 'sector_2_time', 'sector_3_time']:
+                if sector in recent_laps.columns:
+                    sector_data = recent_laps[sector].dropna()
+                    if not sector_data.empty:
+                        result[sector.replace('_time', '')] = float(sector_data.mean())
+                    else:
+                        result[sector.replace('_time', '')] = 0.0
+                else:
+                    result[sector.replace('_time', '')] = 0.0
+            
+            return result
+        except:
+            return {}
+
+    def _get_compound_average_pace_safe(self, session_id: str, tire_compound: str) -> float:
+        """Get compound average pace safely"""
         try:
             with db_pool.get_connection() as conn:
-                session_placeholders = ','.join(['?' for _ in session_ids])
-                query = f"""
-                    SELECT 
-                        l.driver_code,
-                        COALESCE(l.tire_compound, 'MEDIUM') as tire_compound,
-                        COALESCE(l.tire_age, 1) as tire_age,
-                        l.lap_time,
-                        l.lap_number,
-                        COALESCE(s.air_temp, 25.0) as air_temp,
-                        COALESCE(s.track_temp, 35.0) as track_temp,
-                        l.session_id
-                    FROM lap_times l
-                    JOIN sessions s ON l.session_id = s.session_id
-                    WHERE l.session_id IN ({session_placeholders})
-                    AND COALESCE(l.deleted, 0) = 0
-                    AND l.lap_time IS NOT NULL
-                    AND l.lap_time BETWEEN 60 AND 120
-                    AND l.tire_age > 0
-                    ORDER BY l.session_id, l.driver_code, l.lap_number
+                query = """
+                    SELECT AVG(lap_time) as avg_pace
+                    FROM lap_times
+                    WHERE session_id = ? 
+                        AND tire_compound = ?
+                        AND COALESCE(deleted, 0) = 0
+                        AND lap_time BETWEEN 60 AND 120
                 """
-
-                data = pd.read_sql_query(query, conn, params=tuple(session_ids))
-
-                if data.empty:
-                    return pd.DataFrame()
-
-                # Calculate degradation features safely
-                degradation_data = []
                 
-                for (session_id, driver, compound), group in data.groupby(['session_id', 'driver_code', 'tire_compound']):
-                    if len(group) < 3:
-                        continue
-                    
-                    group = group.sort_values('lap_number')
-                    
-                    # Safe degradation calculation
-                    try:
-                        initial_pace = group['lap_time'].iloc[:3].mean()
-                        final_pace = group['lap_time'].iloc[-3:].mean()
-                        stint_length = len(group)
-                        
-                        if stint_length > 1 and not np.isnan(initial_pace) and not np.isnan(final_pace):
-                            degradation_rate = (final_pace - initial_pace) / stint_length
-                        else:
-                            degradation_rate = 0.0
-                        
-                        degradation_data.append({
-                            'driver_code': driver,
-                            'tire_compound': compound,
-                            'stint_length': stint_length,
-                            'initial_pace': initial_pace,
-                            'degradation_rate': degradation_rate,
-                            'avg_air_temp': group['air_temp'].mean(),
-                            'avg_track_temp': group['track_temp'].mean(),
-                            'session_id': session_id
-                        })
-                    except:
-                        continue
-
-                if degradation_data:
-                    result_df = pd.DataFrame(degradation_data)
-                    # Remove any rows with NaN values
-                    result_df = result_df.dropna()
-                    self.logger.info(f'Prepared {len(result_df)} degradation records')
-                    return result_df
+                result = pd.read_sql_query(query, conn, params=(session_id, tire_compound))
+                
+                if not result.empty and result.iloc[0]['avg_pace'] is not None:
+                    return float(result.iloc[0]['avg_pace'])
                 else:
-                    return pd.DataFrame()
-
+                    return 90.0  # Fallback average
+                    
         except Exception as e:
-            self.logger.error(f'Error preparing tire degradation features: {e}')
-            return pd.DataFrame()
-
-    def train_tire_degradation_model(self, session_ids: List[str]) -> ModelPerformance:
-        """Train tire degradation model safely"""
-        try:
-            data = self.prepare_tire_degradation_features(session_ids)
-
-            if data.empty:
-                self.logger.error('No data available for tire degradation training')
-                return ModelPerformance('tire_degradation', float('inf'), float('inf'), -1, float('inf'))
-            
-            # Prepare features
-            X, y = self._prepare_degradation_model_data_safe(data)
-
-            if X.empty or len(y) == 0:
-                self.logger.error('No valid features for degradation training')
-                return ModelPerformance('tire_degradation', float('inf'), float('inf'), -1, float('inf'))
-            
-            # Clean data
-            mask = ~(np.isnan(X).any(axis=1) | np.isnan(y) | np.isinf(X).any(axis=1) | np.isinf(y))
-            X = X[mask]
-            y = y[mask]
-            
-            if len(X) < 5:
-                self.logger.error('Insufficient clean data for degradation training')
-                return ModelPerformance('tire_degradation', float('inf'), float('inf'), -1, float('inf'))
-            
-            # Split and train
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-            performance = self._train_single_model_safe('tire_degradation', X_train, X_test, y_train, y_test)
-            
-            if performance.mae != float('inf'):
-                self._save_model('tire_degradation', X.columns.tolist())
-
-            return performance
-            
-        except Exception as e:
-            self.logger.error(f"Error training tire degradation model: {e}")
-            return ModelPerformance('tire_degradation', float('inf'), float('inf'), -1, float('inf'))
-
-    def _prepare_degradation_model_data_safe(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-        """Prepare degradation model data safely"""
-        try:
-            feature_columns = ['stint_length', 'avg_track_temp', 'avg_air_temp', 'initial_pace']
-            categorical_columns = ['tire_compound', 'driver_code']
-
-            # Check columns exist
-            missing_cols = [col for col in feature_columns + categorical_columns if col not in data.columns]
-            if missing_cols:
-                self.logger.error(f"Missing columns: {missing_cols}")
-                return pd.DataFrame(), pd.Series()
-
-            X = data[feature_columns + categorical_columns].copy()
-            
-            # Handle numerical features
-            if 'degradation_numerical_imputer' not in self.imputers:
-                self.imputers['degradation_numerical_imputer'] = SimpleImputer(strategy='median')
-            
-            X[feature_columns] = self.imputers['degradation_numerical_imputer'].fit_transform(X[feature_columns])
-            
-            # Encode categorical variables safely
-            for col in categorical_columns:
-                if col not in self.label_encoders:
-                    self.label_encoders[col] = LabelEncoder()
-                X[col] = X[col].fillna('Unknown').astype(str)
-                X[col] = self.label_encoders[col].fit_transform(X[col])
-            
-            # Scale features
-            if 'degradation_scaler' not in self.scalers:
-                self.scalers['degradation_scaler'] = StandardScaler()
-                X_scaled = self.scalers['degradation_scaler'].fit_transform(X)
-            else:
-                X_scaled = self.scalers['degradation_scaler'].transform(X)
-            
-            X = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
-            y = data['degradation_rate'].dropna()
-            
-            # Align indices
-            common_indices = X.index.intersection(y.index)
-            X = X.loc[common_indices]
-            y = y.loc[common_indices]
-            
-            return X, y
-        
-        except Exception as e:
-            self.logger.error(f"Error preparing degradation model data: {e}")
-            return pd.DataFrame(), pd.Series()
+            self.logger.error(f"Error getting compound average: {e}")
+            return 90.0
 
     def get_model_performance_summary(self) -> Dict[str, Any]:
         """Get model performance summary"""
@@ -1199,6 +1413,22 @@ if __name__ == "__main__":
                 print(f"Confidence: {prediction.confidence_interval}")
             else:
                 print("Prediction failed")
+        
+        # Example tire degradation prediction
+        print("\nMaking tire degradation prediction...")
+        degradation = ml_models.predict_tire_degradation(
+            session_id="2024_abu_dhabi_grand_prix_r",
+            driver_code="HAM",
+            tire_compound="MEDIUM",
+            stint_length=15,
+            initial_pace=89.5,
+            avg_track_temp=42.5
+        )
+        
+        if degradation is not None:
+            print(f"Predicted degradation rate: {degradation:.4f} seconds per lap")
+        else:
+            print("Degradation prediction failed")
         
         # Model summary
         summary = ml_models.get_model_performance_summary()

@@ -167,38 +167,55 @@ async def get_sessions():
         logger.error(f"Error getting sessions: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+# Update your session summary endpoint in main.py
 @app.get("/api/v1/sessions/{session_id}/summary", response_model=SessionSummary)
-async def get_session_summary(
-    session_id: str = Path(..., description="Session ID")
-):
+async def get_session_summary(session_id: str = Path(..., description="Session ID")):
     """Get session summary statistics"""
     try:
         if not db_pool:
             raise HTTPException(status_code=503, detail="Database not available")
             
         with db_pool.get_connection() as conn:
+            # First check if session exists
+            session_exists = conn.execute(
+                "SELECT COUNT(*) as count FROM sessions WHERE session_id = ?", 
+                (session_id,)
+            ).fetchone()
+            
+            if session_exists['count'] == 0:
+                raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+            
+            # Then get lap times data
             cursor = conn.execute("""
                 SELECT 
                     COUNT(*) as total_laps,
                     COUNT(DISTINCT driver_code) as total_drivers,
-                    MIN(lap_time) as fastest_lap,
-                    AVG(lap_time) as avg_lap_time,
+                    MIN(CASE WHEN lap_time IS NOT NULL THEN lap_time END) as fastest_lap,
+                    AVG(CASE WHEN lap_time IS NOT NULL THEN lap_time END) as avg_lap_time,
                     COUNT(CASE WHEN deleted = 1 THEN 1 END) as deleted_laps
                 FROM lap_times
-                WHERE session_id = ? AND lap_time IS NOT NULL
+                WHERE session_id = ?
             """, (session_id,))
             
             result = cursor.fetchone()
             
             if not result or result['total_laps'] == 0:
-                raise HTTPException(status_code=404, detail="Session not found or no data")
+                # Session exists but has no lap data
+                return SessionSummary(
+                    session_id=session_id,
+                    total_laps=0,
+                    total_drivers=0,
+                    fastest_lap=0.0,
+                    avg_lap_time=0.0,
+                    deleted_laps=0
+                )
             
             return SessionSummary(
                 session_id=session_id,
                 total_laps=result['total_laps'],
                 total_drivers=result['total_drivers'],
-                fastest_lap=result['fastest_lap'],
-                avg_lap_time=result['avg_lap_time'],
+                fastest_lap=result['fastest_lap'] or 0.0,
+                avg_lap_time=result['avg_lap_time'] or 0.0,
                 deleted_laps=result['deleted_laps']
             )
             
@@ -207,7 +224,6 @@ async def get_session_summary(
     except Exception as e:
         logger.error(f"Error getting session summary: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
-
 @app.get("/api/v1/sessions/{session_id}/lap-times")
 async def get_lap_times(
     session_id: str = Path(..., description="Session ID"),

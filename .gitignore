@@ -126,3 +126,4 @@ logs/
 data/
 notebooks/
 src/data_pipeline/f1_diagnostic_tool.py
+fastf1_cache/
